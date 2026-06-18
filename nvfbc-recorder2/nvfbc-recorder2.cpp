@@ -25,7 +25,7 @@
 
 // Nastavení bufferu (např. 30 sekund při 60 FPS = 1800 snímků)
 const int REPLAY_SECONDS = 30;
-const int FPS = 60;
+const int FPS = 30;
 const size_t MAX_BUFFER_FRAMES = REPLAY_SECONDS * FPS;
 
 std::deque<VideoPacket> replayBuffer;
@@ -446,9 +446,8 @@ int main() {
 	}
 
 	frameTimer.reset();
-	int fps = 30;
 	auto next_frame_time = std::chrono::steady_clock::now();
-	const auto frame_duration = std::chrono::microseconds(1000000 / fps);
+	const auto frame_duration = std::chrono::microseconds(1000000 / FPS);
 	while (isRecording) {
 		grabTimer.reset();
 		next_frame_time += frame_duration;
