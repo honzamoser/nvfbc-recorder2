@@ -8,7 +8,8 @@
 
 #pragma once
 #include "NvEncodeAPI.h"
-
+#include <deque>
+#include <vector>
  // Encodering params structure, contains the data needed to initialize
  // an encoder.
 
@@ -18,6 +19,11 @@ static char __NVEncodeLibName32[] = "nvEncodeAPI.dll";
 static char __NVEncodeLibName64[] = "nvEncodeAPI64.dll";
 
 typedef NVENCSTATUS(__stdcall* MYPROC)(NV_ENCODE_API_FUNCTION_LIST*);
+
+struct VideoPacket {
+    std::vector<uint8_t> data;
+    bool isKeyframe;
+};
 
 typedef struct
 {
@@ -90,6 +96,7 @@ public:
     HRESULT SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsigned int dwBufferWidth, unsigned int dwBitRate);
     HRESULT LaunchEncode(unsigned int i, CUdeviceptr devptr);
     HRESULT GetBitstream(unsigned int i, FILE* fout);
+    bool GetBitstreamData(uint32_t bufferIndex, VideoPacket& outPacket);
     HRESULT TearDown();
     HRESULT Reconfigure(unsigned int dwWidth, unsigned int dwHeight, unsigned int dwBufferWidth, unsigned int dwBitRate);
 private:

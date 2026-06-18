@@ -34,7 +34,7 @@ Encoder::Encoder()
     m_dwCodecProfileGUIDCount = 0;
     m_stCodecProfileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
     m_dwPresetGUIDCount = 0;
-    m_stPresetGUID = NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID;
+    m_stPresetGUID = NV_ENC_PRESET_LOW_LATENCY_HP_GUID;
     m_dwInputFmtCount = 0;
     m_pAvailableSurfaceFmts = NULL;
     m_dwInputFormat = NV_ENC_BUFFER_FORMAT_NV12_PL;
@@ -121,8 +121,8 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     m_stInitEncParams.encodeGUID = m_stEncodeGUID;
     m_stInitEncParams.presetGUID = m_stPresetGUID;
     m_stInitEncParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    m_stInitEncParams.encodeWidth = dwWidth;
-    m_stInitEncParams.encodeHeight = dwHeight;
+    m_stInitEncParams.encodeWidth = 1920;
+    m_stInitEncParams.encodeHeight = 1080;
     m_stInitEncParams.frameRateDen = 1;
     m_stInitEncParams.frameRateNum = 30;
     m_stInitEncParams.enablePTD = 1;
@@ -142,10 +142,26 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     // Set up encoder configuration, local state vars
     memcpy(&m_stEncodeConfig, &m_stPresetConfig.presetCfg, sizeof(NV_ENC_CONFIG));
     m_stEncodeConfig.version = NV_ENC_CONFIG_VER;
+    // 1. Zmìníme režim na Variabilní Bitrate (Ideální pro herní nahrávání)
+    m_stEncodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+
+    // 2. Nastavíme prùmìrný a maximální limit (dovolíme mu 50% skok pro IDR snímky)
     m_stEncodeConfig.rcParams.averageBitRate = dwBitRate;
-    m_stEncodeConfig.rcParams.maxBitRate = 6 * (dwBitRate / 5); // 1.2 times
-    m_stEncodeConfig.rcParams.vbvBufferSize = dwBitRate / (m_stInitEncParams.frameRateNum / m_stInitEncParams.frameRateDen);
-    m_stEncodeConfig.rcParams.vbvInitialDelay = m_stEncodeConfig.rcParams.vbvInitialDelay;
+    m_stEncodeConfig.rcParams.maxBitRate = dwBitRate + (dwBitRate / 2); // 1.5 násobek
+
+    // 3. TOTO JE TEN FIX: Dáme mu obrovský 2sekundový vyrovnávací buffer!
+    m_stEncodeConfig.rcParams.vbvBufferSize = dwBitRate * 2;
+    m_stEncodeConfig.rcParams.vbvInitialDelay = dwBitRate;
+
+    // 4. Adaptivní Kvantizace (AQ) - hardwarové vyhlazení kompresních artefaktù
+    m_stEncodeConfig.rcParams.enableAQ = 1;
+
+	// MODIFIED: Set GOP length to 60 frames (1 second at 60 fps)
+    m_stEncodeConfig.gopLength = 30;
+	m_stEncodeConfig.frameIntervalP = 1; // Set to 1 for low latency
+
+    m_stEncodeConfig.encodeCodecConfig.h264Config.idrPeriod = 30;
+    m_stEncodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 
     m_stInitEncParams.encodeConfig = &m_stEncodeConfig;
 
@@ -337,7 +353,34 @@ HRESULT Encoder::GetBitstream(unsigned int i, FILE* fOut)
 
     return S_OK;
 }
+bool Encoder::GetBitstreamData(uint32_t bufferIndex, VideoPacket& outPacket)
+{
 
+    if (m_bUseMappedResource && m_stInputSurface[bufferIndex].hInputSurface != NULL)
+    {
+        m_pEncodeAPI->nvEncUnmapInputResource(m_hEncoder, m_stInputSurface[bufferIndex].hInputSurface);
+        m_stInputSurface[bufferIndex].hInputSurface = NULL; // Tohle pøinutí LaunchEncode mapovat znovu!
+    }
+
+    NV_ENC_LOCK_BITSTREAM lockBitstreamData = { NV_ENC_LOCK_BITSTREAM_VER };
+    lockBitstreamData.outputBitstream = m_stBitstreamBuffer[bufferIndex].hBitstreamBuffer;
+
+    if (m_pEncodeAPI->nvEncLockBitstream(m_hEncoder, &lockBitstreamData) != NV_ENC_SUCCESS)
+        return false;
+
+    // Zkopírujeme data komprimovaného snímku do našeho Vektoru
+    outPacket.data.assign(
+        (uint8_t*)lockBitstreamData.bitstreamBufferPtr,
+        (uint8_t*)lockBitstreamData.bitstreamBufferPtr + lockBitstreamData.bitstreamSizeInBytes
+    );
+
+    // Zjistíme, zda jde o klíèový snímek (IDR)
+    outPacket.isKeyframe = outPacket.isKeyframe = (lockBitstreamData.pictureType == NV_ENC_PIC_TYPE_IDR ||
+        lockBitstreamData.pictureType == NV_ENC_PIC_TYPE_I);
+
+    m_pEncodeAPI->nvEncUnlockBitstream(m_hEncoder, lockBitstreamData.outputBitstream);
+    return true;
+}
 HRESULT Encoder::AllocateIOBufs()
 {
     NVENCSTATUS status = NV_ENC_SUCCESS;
