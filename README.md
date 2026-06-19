@@ -15,7 +15,7 @@ With some changes, this could work on Linux, where it wouldn't need to patch the
 
 DVR branch
 --
-
+(Disclaimer: Before you ask, yes, a lot of this was coded using AI, but it would not be possible without it)
 This branch allows you to record in DVR mode, saving the screen in a circular buffer and allowing you to save the last 30 or so seconds.
 
 How to record: 
