@@ -175,7 +175,7 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     m_stEncodeConfig.encodeCodecConfig.h264Config.idrPeriod = 30;
     m_stEncodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 
-	m_stInitEncParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+    //m_stInitEncParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
 
     m_stInitEncParams.encodeConfig = &m_stEncodeConfig;
 
