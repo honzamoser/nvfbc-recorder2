@@ -27,6 +27,9 @@
     <ClCompile Include="Timer.cpp">
       <Filter>Zdrojové soubory</Filter>
     </ClCompile>
+    <ClCompile Include="nvEncodeAPI_new.h">
+      <Filter>Hlavičkové soubory</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="nvFBC.h">

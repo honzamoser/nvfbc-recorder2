@@ -19,7 +19,16 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include "Encoder.h"
-#include "Timer.h"
+
+
+
+
+// Nastavení bufferu (např. 30 sekund při 60 FPS = 1800 snímků)
+const int REPLAY_SECONDS = 30;
+const int FPS = 30;
+const size_t MAX_BUFFER_FRAMES = REPLAY_SECONDS * FPS;
+
+std::deque<VideoPacket> replayBuffer;
 
 void* create(NvFBC_CreateFunctionExType create, DWORD type, DWORD* maxWidth, DWORD* maxHeight, int adapter = 0, void* devicePtr = NULL) {
 	NVFBCRESULT res = NVFBC_SUCCESS;
@@ -214,8 +223,52 @@ int CaptureToSys() {
 
 	return 0;
 }
+
+std::vector<uint8_t> cursorHostBuffer(64 * 64 * 4, 0);
+CUdeviceptr cursorDeviceBuffer = 0;
+HCURSOR lastCursor = NULL;
+int lastCurX = -1, lastCurY = -1; // Přidáno pro detekci pohybu
+
+// Pomocná funkce: Vytáhne z Windows 32-bit obrázek aktuálního kurzoru a nasype ho do GPU
+void UpdateCursorImage(HCURSOR hCursor) {
+	if (!cursorDeviceBuffer) {
+		cuMemAlloc(&cursorDeviceBuffer, 64 * 64 * 4); // Zabere to jen 16 KB VRAM
+	}
+
+	HDC hdc = GetDC(NULL);
+	HDC memDC = CreateCompatibleDC(hdc);
+
+	BITMAPINFO bmi = {};
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = 64;
+	bmi.bmiHeader.biHeight = -64; // Top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	void* bits = nullptr;
+	HBITMAP hBitmap = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+	SelectObject(memDC, hBitmap);
+
+	memset(bits, 0, 64 * 64 * 4); // Průhledné pozadí
+	DrawIconEx(memDC, 0, 0, hCursor, 0, 0, 0, NULL, DI_NORMAL); // Vykreslí kurzor v nativní velikosti
+
+	memcpy(cursorHostBuffer.data(), bits, 64 * 64 * 4);
+
+	DeleteObject(hBitmap);
+	DeleteDC(memDC);
+	ReleaseDC(NULL, hdc);
+
+	std::cout << "Updating cursosr with HCURSOR: " << hCursor << "\n";
+
+	// Bleskový nahrávací přenos do grafiky
+	cuMemcpyHtoD(cursorDeviceBuffer, cursorHostBuffer.data(), 64 * 64 * 4);
+}
+
 typedef NVENCSTATUS(NVENCAPI* PFN_NVENCODEAPICREATEINSTANCE)(NV_ENCODE_API_FUNCTION_LIST*);
-extern "C" cudaError launch_CudaARGB2NV12Process(int w, int h, CUdeviceptr pARGBImage, CUdeviceptr pNV12Image);
+extern "C" cudaError launch_CudaARGB2NV12Process(int srcW, int srcH, int dstW, int dstH,
+	CUdeviceptr pARGBImage, CUdeviceptr pNV12Image,
+	CUdeviceptr pCursor, int cursorX, int cursorY, bool drawCursor);
 
 FILE* GetOutputFile(std::string baseName, DWORD width, DWORD height)
 {
@@ -243,6 +296,66 @@ inline bool primary_context_is_active(int device_id)
 	if (status != CUDA_SUCCESS) { /* error handling here */ }
 	return is_active;
 }
+
+void SaveReplayBuffer() {
+	if (replayBuffer.empty()) {
+		std::cout << "[CHYBA] Buffer je prazdny!\n";
+		return;
+	}
+
+	int keyframeCount = 0;
+	int startIndex = -1;
+
+	// Najdeme všechny klíčové snímky a určíme první čistý řezný bod
+	for (size_t i = 0; i < replayBuffer.size(); ++i) {
+		if (replayBuffer[i].isKeyframe) {
+			keyframeCount++;
+			if (startIndex == -1) {
+				startIndex = i; // Zafixujeme pozici prvního klíčového snímku
+			}
+		}
+	}
+
+	std::cout << "\n[DEBUG DVR]\n";
+	std::cout << "Celkem snimku v pameti: " << replayBuffer.size() << "\n";
+	std::cout << "Pocet klicovych snimku (SPS/IDR): " << keyframeCount << "\n";
+
+	if (startIndex == -1) {
+		std::cout << "[FATAL] V bufferu neni zadny klicovy snimek! Video pravdepodobne zamrzne.\n";
+		startIndex = 0; // Nouzový fallback
+	}
+	else {
+		std::cout << "Rezu video od snimku cislo: " << startIndex << " (Zdravy zacatek)\n";
+	}
+
+	FILE* fReplay = fopen("replay_saved.h264", "wb");
+	if (fReplay) {
+		// Zapisujeme až od nalezeného čistého startIndexu
+		for (size_t i = startIndex; i < replayBuffer.size(); ++i) {
+			fwrite(replayBuffer[i].data.data(), 1, replayBuffer[i].data.size(), fReplay);
+		}
+		fclose(fReplay);
+		std::cout << "Replay uspesne ulozen na disk!\n\n";
+	}
+}
+
+DWORD default_magic[] = { 0xAEF57AC5, 0x401D1A39, 0x1B856BBE, 0x9ED0CEBA };
+void* magic = default_magic;
+NvU32 magic_size = sizeof(default_magic);
+
+
+struct MonitorInfo {
+	int left;
+	int top;
+};
+std::vector<MonitorInfo> globalMonitors;
+
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
+	std::vector<MonitorInfo>* monitors = (std::vector<MonitorInfo>*)dwData;
+	monitors->push_back({ lprcMonitor->left, lprcMonitor->top });
+	return TRUE;
+}
+
 int main() {
     // 1. INITIALIZE CUDA CONTEXT VIA WINDOWS DRIVER SYSTEM
     
@@ -250,6 +363,8 @@ int main() {
 	cudaGetDeviceProperties(&prop, 0);
 	std::cout << "DEBUG: Aktivni GPU pro kernel je: " << prop.name
 		<< " (Compute " << prop.major << "." << prop.minor << ")\n";
+
+	std::cout << "ANO TOHLE JE NOVA VERZE";
 
 	//return CaptureToSys();
 	HMODULE handleNVFBC = ::LoadLibraryA("C:\\Windows\\System32\\NvFBC64.dll");
@@ -283,6 +398,20 @@ int main() {
 	DWORD maxDisplayWidth = 0;
 	DWORD maxDisplayHeight = 0;
 
+	globalMonitors.clear();
+	EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, (LPARAM)&globalMonitors);
+
+	// Vybereme offset podle indexu, který nahráváš (měl by odpovídat createParams.dwAdapterIdx)
+	int targetMonitorIndex = 0; // Změň na 0, 1, 2 podle toho, jaký monitor nahráváš
+	int monitorOffsetX = 0;
+	int monitorOffsetY = 0;
+
+	if (targetMonitorIndex < globalMonitors.size()) {
+		monitorOffsetX = globalMonitors[targetMonitorIndex].left;
+		monitorOffsetY = globalMonitors[targetMonitorIndex].top;
+		std::cout << "[INFO] Monitor offset -> X: " << monitorOffsetX << " Y: " << monitorOffsetY << "\n";
+	}
+
 	NvFBCCreateParams createParams;
 	memset(&createParams, 0, sizeof(createParams));
 	createParams.dwVersion = NVFBC_CREATE_PARAMS_VER;
@@ -292,10 +421,10 @@ int main() {
 	createParams.dwMaxDisplayWidth = 0;
 
 	createParams.dwInterfaceVersion = 112;
-	createParams.dwAdapterIdx = 0;
+	createParams.dwAdapterIdx = targetMonitorIndex;
 
-	createParams.pPrivateData = NULL;
-	createParams.dwPrivateDataSize = 0;
+	createParams.pPrivateData = magic;
+	createParams.dwPrivateDataSize = magic_size;
 	createParams.pNvFBC = NULL;
 
 	//NvFBCCuda* pNVFBCCuda = (NvFBCCuda*)create(pfnNVFBC_CreateEx, NVFBC_SHARED_CUDA, &maxDisplayWidth, &maxDisplayHeight);
@@ -321,7 +450,7 @@ int main() {
 		 cuCtxGetCurrent(&cudaContext);
 	 }
 
-	 cuCtxPushCurrent(cudaContext);
+	 //cuCtxPushCurrent(cudaContext);
 
 	 std::cout << "CUDA context address: " << cudaContext << "\n";
 
@@ -341,20 +470,27 @@ int main() {
 	std::cout << "Max buffer size for CUDA capture: " << maxBufferSize << " bytes\n";
 
 	CUdeviceptr argbbuffer;
-	CUdeviceptr nv12Buffer;
 	CUresult argbBufferResult = cuMemAlloc(&argbbuffer, maxBufferSize);
-	CUresult nv12BufferResult = cuMemAlloc(&nv12Buffer, createParams.dwMaxDisplayWidth * createParams.dwMaxDisplayHeight * 1.5);
 
-	if (argbBufferResult != CUDA_SUCCESS || nv12BufferResult != CUDA_SUCCESS) {
+	std::vector<CUdeviceptr> nv12Buffers(MAX_BUF_QUEUE);
+	size_t nv12Size = createParams.dwMaxDisplayWidth * createParams.dwMaxDisplayHeight * 1.5;
+
+	for (int i = 0; i < MAX_BUF_QUEUE; i++) {
+		cuMemAlloc(&nv12Buffers[i], nv12Size);
+	}
+	
+
+	if (argbBufferResult != CUDA_SUCCESS) {
 		std::cerr << "Error allocating CUDA buffers: "
 			<< "ARGB buffer result=" << argbBufferResult
-			<< ", NV12 buffer result=" << nv12BufferResult << "\n";
+			<< ", NV12 buffer result=" << "\n";
 		return -1;
 	}
 
 	NVFBC_CUDA_SETUP_PARAMS setupParams = { 0 };
 	setupParams.dwVersion = NVFBC_CUDA_SETUP_PARAMS_VER;
 	setupParams.eFormat = NVFBC_TOCUDA_ARGB;
+	setupParams.bEnableSeparateCursorCapture = false;
 
 	NVFBCRESULT setupResult = pNVFBCCuda->NvFBCCudaSetup(&setupParams);
 
@@ -377,8 +513,8 @@ int main() {
 	DWORD currentWidth = 0, currentHeight = 0;
 
 
-	
-		
+	bool isRecording = true;
+	uint64_t frameCnt = 0;
 	Encoder encoder;
 
 	if (S_OK != encoder.Init(cudaContext, maxBufferSize))
@@ -388,143 +524,140 @@ int main() {
 	}
 
 	frameTimer.reset();
-
-	for (int frameCnt = 0; frameCnt < 120; ++frameCnt) {
-		grabTimer.reset();
-
-		NvFBCFrameGrabInfo frameGrabInfo;
-		NVFBC_CUDA_GRAB_FRAME_PARAMS grabParams = { 0 };
-		grabParams.dwVersion = NVFBC_CUDA_GRAB_FRAME_PARAMS_VER;
-		grabParams.dwFlags = 0;
-		grabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
-		grabParams.pCUDADeviceBuffer = (void*)argbbuffer;
-
-		NVFBCRESULT grabResult = pNVFBCCuda->NvFBCCudaGrabFrame(&grabParams);
-
-		if (grabResult != NVFBC_SUCCESS) {
-			std::cerr << "Error grabbing frame to CUDA buffer: " << grabResult << "\n";
-			std::cerr << frameGrabInfo.bMustRecreate ? "Session needs to be recreated.\n" : "Session is still valid.\n";
-		}
-		else {
-			std::cout << "CUDA frame grab successful. Frame dimensions: " << frameGrabInfo.dwWidth << "x" << frameGrabInfo.dwHeight << "\n";
-		}
-
-		if (grabResult == NVFBCRESULT::NVFBC_SUCCESS) {
-			if (frameCnt == 0)
-			{
-				if (S_OK != encoder.SetupEncoder(frameGrabInfo.dwWidth, frameGrabInfo.dwHeight, frameGrabInfo.dwWidth, 8000000))
-				{
-					fprintf(stderr, "Failed to set up encoder.\n");
-					break;
-				}
-				currentWidth = frameGrabInfo.dwWidth;
-				currentHeight = frameGrabInfo.dwHeight;
-				fout = GetOutputFile("output", currentWidth, currentHeight);
-			}
-			double grabTime = grabTimer.now();
-			double encodeTime = frameTimer.now() - grabTime;
-
-			printf("Grab %d: frame %d, grab time %.2f, encode time %.2f ms, overlay %s\n",
-				frameCnt, frameCnt, grabTime, encodeTime,
-				frameGrabInfo.bOverlayActive ? "active" : "in-active");
-
-			frameTimer.reset();
-
-			if ((currentWidth != frameGrabInfo.dwBufferWidth) || (currentHeight != frameGrabInfo.dwHeight))
-			{
-				//! Save the height and width so we can determine if it has changed.
-				currentWidth = frameGrabInfo.dwBufferWidth;
-				currentHeight = frameGrabInfo.dwHeight;
-
-				encoder.Reconfigure(frameGrabInfo.dwWidth, frameGrabInfo.dwHeight, frameGrabInfo.dwWidth, 8000000);
+	auto next_frame_time = std::chrono::steady_clock::now();
+	const auto frame_duration = std::chrono::microseconds(1000000 / FPS); // U tebe např. fps = 60
 
 
-				//! Close the output file
-				if (NULL != fout)
-				{
-					fclose(fout);
-					fout = NULL;
-				}
+		while (isRecording) {
+			grabTimer.reset();
 
-				//! Get a new file pointer to write the stream to.
-				fout = GetOutputFile("output", currentWidth, currentHeight);
-
-				if (!fout)
-					return -1;
+			if (GetAsyncKeyState(VK_F10) & 0x8000) {
+				std::cout << "\n[F10] zachyceno! Ukládám...\n";
+				SaveReplayBuffer();
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				isRecording = false;
+				break;
 			}
 
-			cudaError_t kernelErr = launch_CudaARGB2NV12Process(frameGrabInfo.dwWidth, frameGrabInfo.dwHeight, argbbuffer, nv12Buffer);
-			if (kernelErr != cudaSuccess) {
-				std::cerr << "Kernel zhavaroval! Chyba: " << cudaGetErrorString(kernelErr) << "\n";
-			}
+			NvFBCFrameGrabInfo frameGrabInfo;
+			NVFBC_CUDA_GRAB_FRAME_PARAMS grabParams = { 0 };
+			grabParams.dwVersion = NVFBC_CUDA_GRAB_FRAME_PARAMS_VER;
+			grabParams.dwFlags = 0;
 
-			cuStreamSynchronize(NULL);
-			if (frameCnt == 0) {
-				std::cout << "\n[DEBUG] Spouštím dump NV12 paměti z GPU...\n";
+			grabParams.pNvFBCFrameGrabInfo = &frameGrabInfo;
+			grabParams.pCUDADeviceBuffer = (void*)argbbuffer;
 
-				// Spočítáme přesnou velikost NV12 snímku v bajtech
-				size_t y_size = frameGrabInfo.dwWidth * frameGrabInfo.dwHeight;
-				size_t uv_size = y_size / 2;
-				size_t total_nv12_size = y_size + uv_size;
+			NVFBCRESULT grabResult = pNVFBCCuda->NvFBCCudaGrabFrame(&grabParams);
 
-				// Alokujeme dočasný buffer v RAM procesoru (CPU)
-				std::vector<unsigned char> cpuBuffer(total_nv12_size);
+			if (grabResult == NVFBCRESULT::NVFBC_SUCCESS) {
+				auto now = std::chrono::steady_clock::now();
+				int frames_to_generate = 1;
 
-				// Zkopírujeme surová data z GPU (nv12Buffer) do naší RAM (cpuBuffer)
-				CUresult copyRes = cuMemcpyDtoH(cpuBuffer.data(), nv12Buffer, total_nv12_size);
+				std::cout << "Captured frame " << frameCnt << " at " << frameGrabInfo.dwWidth << "x" << frameGrabInfo.dwHeight
+					<< ", buffer size: " << frameGrabInfo.dwBufferWidth << " bytes\n";
+		
+				if (now > next_frame_time) {
+					auto missed_time = std::chrono::duration_cast<std::chrono::microseconds>(now - next_frame_time);
+					int missed_frames = missed_time.count() / frame_duration.count();
 
-				if (copyRes != CUDA_SUCCESS) {
-					std::cerr << "[DEBUG] cuMemcpyDtoH selhalo s kódem: " << copyRes << "\n";
-				}
-				else {
-					// Zapíšeme data do binárního souboru
-					FILE* dumpFile = fopen("debug_dump.yuv", "wb");
-					if (dumpFile) {
-						fwrite(cpuBuffer.data(), 1, total_nv12_size, dumpFile);
-						fclose(dumpFile);
-						std::cout << "[DEBUG] Surová NV12 data byla úspěšně uložena do 'debug_dump.yuv'!\n";
-						std::cout << "[DEBUG] Velikost souboru: " << total_nv12_size << " bajtů.\n\n";
+					if (missed_frames > FPS * 2) {
+						missed_frames = FPS * 2; // Omezíme doplňování na max 2 sekundy
+						next_frame_time = now;   // Tvrdý reset časovače do přítomnosti
 					}
 					else {
-						std::cerr << "[DEBUG] Nepodařilo se otevřít soubor pro zápis.\n";
+						next_frame_time += std::chrono::microseconds(missed_frames * frame_duration.count());
+					}
+					frames_to_generate += missed_frames;
+				}
+
+				int targetW = 1920;
+				int targetH = 1080;
+				if (frameCnt == 0) {
+					HRESULT encoderSetupResult = encoder.SetupEncoder(targetW, targetH, targetW, 25000000);
+					if (encoderSetupResult != S_OK) {
+						fprintf(stderr, "Failed to setup encoder\n");
+						return -1;
+					}
+					currentWidth = frameGrabInfo.dwWidth;
+					currentHeight = frameGrabInfo.dwHeight;
+				}
+
+				CURSORINFO ci = { sizeof(CURSORINFO) };
+				bool drawCursor = false;
+				int curX = 0, curY = 0;
+
+				if (GetCursorInfo(&ci) && ci.flags == CURSOR_SHOWING) {
+					drawCursor = true;
+
+					// Získání přesné špičky kurzoru (Hotspot = hrot šipky)
+					ICONINFO iconInfo;
+					if (GetIconInfo(ci.hCursor, &iconInfo)) {
+						curX = ci.ptScreenPos.x - iconInfo.xHotspot - monitorOffsetX;
+						curY = ci.ptScreenPos.y - iconInfo.yHotspot - monitorOffsetY;
+						DeleteObject(iconInfo.hbmColor);
+						DeleteObject(iconInfo.hbmMask);
+					}
+					else {
+						curX = ci.ptScreenPos.x - monitorOffsetX;
+						curY = ci.ptScreenPos.y - monitorOffsetY;
+					}
+
+					// Pokud se tvar kurzoru změnil (např. ze šipky na ručičku nad odkazem), updatneme ho v GPU
+					if (ci.hCursor != lastCursor) {
+						UpdateCursorImage(ci.hCursor);
+						lastCursor = ci.hCursor;
 					}
 				}
-			}
 
-			CUdeviceptr activeBuffer = nv12Buffer;
-			unsigned int frameIDX = frameCnt % MAX_BUF_QUEUE;
-			if (S_OK != encoder.LaunchEncode(frameIDX, activeBuffer))
-			{
-				fprintf(stderr, "Failed encoding frame %d\n", frameCnt);
+
+				unsigned int currentSlot = frameCnt % MAX_BUF_QUEUE;
+				cudaError_t kernelErr = launch_CudaARGB2NV12Process(
+					frameGrabInfo.dwWidth, frameGrabInfo.dwHeight,
+					targetW, targetH,
+					argbbuffer, nv12Buffers[currentSlot], cursorDeviceBuffer, curX, curY, drawCursor
+				);
+				cuStreamSynchronize(NULL);
+
+				for (int f = 0; f < frames_to_generate; f++) {
+					unsigned int encodeSlot = frameCnt % MAX_BUF_QUEUE;
+
+					
+
+					if (encodeSlot != currentSlot) {
+						std::cout << "Replaying skipped frames.";
+						cuMemcpyDtoD(nv12Buffers[encodeSlot], nv12Buffers[currentSlot], nv12Size);
+					}
+
+					if (S_OK != encoder.LaunchEncode(encodeSlot, nv12Buffers[encodeSlot])) {
+						fprintf(stderr, "Failed encoding frame %d\n", frameCnt);
+					}
+
+					VideoPacket packet;
+					if (encoder.GetBitstreamData(encodeSlot, packet)) {
+						replayBuffer.push_back(packet);
+						if (replayBuffer.size() > MAX_BUFFER_FRAMES) {
+							replayBuffer.pop_front();
+						}
+					}
+					frameCnt++;
+				}
+
+				// Konečně posuneme časovač na další budoucí snímek a uspíme smyčku
+				next_frame_time += frame_duration;
+				pNVFBCCuda->NvFBCCudaGPUBasedCPUSleep(frame_duration.count());
+
+			}
+			else {
+				fprintf(stderr, "Grab frame failed. NvFBCCudaGrabFrame returned: %d\n", grabResult);
 				return -1;
 			}
-			if (S_OK != encoder.GetBitstream(frameIDX, fout))
-			{
-				fprintf(stderr, "Failed encoding frame %d\n", frameCnt);
-				return -1;
-			}
-
-			//CUcontext poppedContext;
-			//cuCtxPopCurrent(&poppedContext);
 		}
-		else {
-		
-			fprintf(stderr, "Grab frame failed. NvFBCCudaGrabFrame returned: %d\n", grabResult);
-			return -1;
-		}
-	
-	}
-
-	
 
 	encoder.TearDown();
-
 	if (NULL != fout)
 		fclose(fout);
 
 	pNVFBCCuda->NvFBCCudaRelease();
 	return 0;
-
-	
 }
 
