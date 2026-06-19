@@ -34,10 +34,10 @@ Encoder::Encoder()
     m_dwCodecProfileGUIDCount = 0;
     m_stCodecProfileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
     m_dwPresetGUIDCount = 0;
-    m_stPresetGUID = NV_ENC_PRESET_LOW_LATENCY_HP_GUID;
+    m_stPresetGUID = { 0x36850110, 0x3a07, 0x441f, { 0x94, 0xd5, 0x36, 0x70, 0x63, 0x1f, 0x91, 0xf6 } };
     m_dwInputFmtCount = 0;
     m_pAvailableSurfaceFmts = NULL;
-    m_dwInputFormat = NV_ENC_BUFFER_FORMAT_NV12_PL;
+    m_dwInputFormat = NV_ENC_BUFFER_FORMAT_NV12;
     memset(&m_stInitEncParams, 0, sizeof(m_stInitEncParams));
     memset(&m_stEncodeConfig, 0, sizeof(m_stEncodeConfig));
     memset(&m_stPresetConfig, 0, sizeof(m_stPresetConfig));
@@ -88,6 +88,9 @@ HRESULT Encoder::Init(CUcontext cuCtx, unsigned int dwMaxBufferSize)
     m_cuContext = cuCtx;
     m_dwMaxBufferSize = dwMaxBufferSize;
     // Load EncodeAPI DLL, based on bit-ness
+
+
+
     hr = LoadEncAPI();
     if (SUCCEEDED(hr))
     {
@@ -97,8 +100,17 @@ HRESULT Encoder::Init(CUcontext cuCtx, unsigned int dwMaxBufferSize)
         param.apiVersion = NVENCAPI_VERSION;
         param.device = cuCtx;
         param.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
-        m_pEncodeAPI->nvEncOpenEncodeSessionEx(&param, &m_hEncoder);
+        NVENCSTATUS openStatus = m_pEncodeAPI->nvEncOpenEncodeSessionEx(&param, &m_hEncoder);
+
+        if (openStatus != NV_ENC_SUCCESS)
+        {
+            printf(": Failed to open encode session: %d\n", openStatus);
+            return E_FAIL;
+		}
     }
+
+	printf("Encoder initialized successfully.\n");
+
     return hr;
 }
 
@@ -114,7 +126,7 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     // Validate basic configuration
     if (FAILED(hr = ValidateParams()))
     {
-        fprintf(stderr, __FUNCTION__": Failed to find a valid encoder configuration.\n");
+        printf(": Failed to find a valid encoder configuration.\n");
         return hr;
     }
 
@@ -132,10 +144,10 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     m_stPresetConfig.version = NV_ENC_PRESET_CONFIG_VER;
     m_stPresetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
 
-    status = m_pEncodeAPI->nvEncGetEncodePresetConfig(m_hEncoder, m_stEncodeGUID, m_stPresetGUID, &m_stPresetConfig);
+    status = m_pEncodeAPI->nvEncGetEncodePresetConfigEx(m_hEncoder, m_stEncodeGUID, m_stPresetGUID, NV_ENC_TUNING_INFO_LOW_LATENCY, &m_stPresetConfig);
     if (status != NV_ENC_SUCCESS)
     {
-        fprintf(stderr, __FUNCTION__": Failed to fetch preset encoder config.\n");
+        printf("Failed to fetch preset encoder config. Reason? %d\n", status);
         return E_FAIL;
     }
 
@@ -163,20 +175,22 @@ HRESULT Encoder::SetupEncoder(unsigned int dwWidth, unsigned int dwHeight, unsig
     m_stEncodeConfig.encodeCodecConfig.h264Config.idrPeriod = 30;
     m_stEncodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 
+	m_stInitEncParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+
     m_stInitEncParams.encodeConfig = &m_stEncodeConfig;
 
     // Initialize encoder
     status = m_pEncodeAPI->nvEncInitializeEncoder(m_hEncoder, &m_stInitEncParams);
     if (status != NV_ENC_SUCCESS)
     {
-        fprintf(stderr, __FUNCTION__": Failed to initialize encoder.\n");
+        printf(": Failed to initialize encoder.\n");
         return E_FAIL;
     }
 
     // Allocate IO Buffers
     if (FAILED(hr = AllocateIOBufs()))
     {
-        fprintf(stderr, __FUNCTION__": Failed to allocate IO buffers.\n");
+        printf(": Failed to allocate IO buffers.\n");
         return hr;
     }
     return S_OK;
@@ -244,7 +258,7 @@ HRESULT Encoder::LaunchEncode(unsigned int i, CUdeviceptr devptr)
             param.width = m_dwWidth;
             param.height = m_dwHeight;
             param.pitch = m_dwBufferWidth;
-            param.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12_PL;
+            param.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
             status = m_pEncodeAPI->nvEncRegisterResource(m_hEncoder, &param);
 
             if (m_cuContext) {
@@ -456,9 +470,11 @@ HRESULT Encoder::ReleaseIOBufs()
 HRESULT Encoder::LoadEncAPI()
 {
     // Load NvEncodeAPI DLL based on bit-ness
+    typedef NVENCSTATUS(NVENCAPI* NvEncodeAPIGetMaxSupportedVersion_Type)(uint32_t*);
 
     NVENCSTATUS nvStatus;
     MYPROC nvEncodeAPICreateInstance; // function pointer to create instance in nvEncodeAPI
+    NvEncodeAPIGetMaxSupportedVersion_Type p_NvEncodeAPIGetMaxSupportedVersion;
 
     if (Is64Bit())
     {
@@ -472,7 +488,21 @@ HRESULT Encoder::LoadEncAPI()
     if (m_hinstLib != NULL)
     {
         // Initialize NVENC API
+		p_NvEncodeAPIGetMaxSupportedVersion = (NvEncodeAPIGetMaxSupportedVersion_Type)GetProcAddress(m_hinstLib, "NvEncodeAPIGetMaxSupportedVersion");
         nvEncodeAPICreateInstance = (MYPROC)GetProcAddress(m_hinstLib, "NvEncodeAPICreateInstance");
+
+        if (NULL != p_NvEncodeAPIGetMaxSupportedVersion) {
+            uint32_t  NvencVersion = 0;
+			p_NvEncodeAPIGetMaxSupportedVersion(&NvencVersion);
+
+            uint32_t driverMajor = NvencVersion >> 4;
+            uint32_t driverMinor = NvencVersion & 0xF;
+
+            uint32_t ApiMajor = NVENCAPI_MAJOR_VERSION;
+            uint32_t ApiMinor = NVENCAPI_MINOR_VERSION;
+
+            printf("Your NVENC version is %d.%d, we are running with APIs using %d.%d", driverMajor, driverMinor, ApiMajor, ApiMinor);
+        }
 
         if (NULL != nvEncodeAPICreateInstance)
         {
@@ -515,6 +545,8 @@ HRESULT Encoder::LoadEncAPI()
 
 HRESULT Encoder::ValidateParams()
 {
+
+    std::cout << "Validating encoder parameters" << std::endl;
     HRESULT hr = E_FAIL;
     unsigned int tempCount = 0;
     NVENCSTATUS status = NV_ENC_SUCCESS;
@@ -526,6 +558,10 @@ HRESULT Encoder::ValidateParams()
         return E_FAIL;
     // Validate encoder initialization params based on capabilities exposed by the API
     // Codec GUID
+
+
+
+
     status = m_pEncodeAPI->nvEncGetEncodeGUIDCount(m_hEncoder, &m_dwEncodeGUIDCount);
     if (status != NV_ENC_SUCCESS)
     {
@@ -541,8 +577,22 @@ HRESULT Encoder::ValidateParams()
         return E_FAIL;
     }
 
+	m_stEncodeGUID = pEncGUIDs[0]; // Default to first encoder GUID
+
+    OLECHAR* usingGuid = NULL;
+    StringFromCLSID(m_stEncodeGUID, &usingGuid);
+	printf("Using Encoder GUID: %ls\n", usingGuid);
+
     for (unsigned int i = 0, bFound = false; i < m_dwEncodeGUIDCount; i++)
     {
+        OLECHAR* guidString;
+        StringFromCLSID(pEncGUIDs[i], &guidString);
+		printf("Supported Encoder GUID: %ls\n", guidString);
+	}
+
+    for (unsigned int i = 0, bFound = false; i < m_dwEncodeGUIDCount; i++)
+    {
+		
         if (pEncGUIDs[i] == m_stEncodeGUID)
         {
             // Preset GUID
@@ -553,6 +603,8 @@ HRESULT Encoder::ValidateParams()
                 break;
             }
 
+			printf("Found %d presets for encoder GUID %d\n", m_dwPresetGUIDCount, i);
+
             pPresetGUIDs = (GUID*)malloc(m_dwPresetGUIDCount * sizeof(GUID));
             status = m_pEncodeAPI->nvEncGetEncodePresetGUIDs(m_hEncoder, m_stEncodeGUID, pPresetGUIDs, m_dwPresetGUIDCount, &tempCount);
             if (status != NV_ENC_SUCCESS)
@@ -561,13 +613,29 @@ HRESULT Encoder::ValidateParams()
                 break;
             }
 
+            m_stPresetGUID = pPresetGUIDs[0]; // Default to first preset GUID 
+
+            OLECHAR* guidString;
+            StringFromCLSID(m_stPresetGUID, &guidString);
+            printf("Selected preset GUID: %ls\n", guidString);
+
+            for (unsigned int i = 0, bFound = false; i < m_dwPresetGUIDCount; i++)
+            {
+                OLECHAR* guidString;
+                StringFromCLSID(pPresetGUIDs[i], &guidString);
+				printf("Supported Preset GUID: %ls\n", guidString);
+            }
+
+
+
+
             for (unsigned int i = 0, bFound = false; i < m_dwPresetGUIDCount; i++)
             {
                 if (pPresetGUIDs[i] == m_stPresetGUID)
                 {
                     bFound = true;
                     return S_OK;
-                }
+                } 
             }
             break;
         }
